@@ -215,11 +215,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 #[cfg(feature = "kms-aws")]
 async fn run_kms_migration(args: MigrateToKms) -> Result<(), Box<dyn std::error::Error>> {
-    let mut global_config = tartarus::config::GlobalConfig::new_with_config_path(args.config_path)?;
+    let mut global_config = hyperswitch_card_vault::config::GlobalConfig::new_with_config_path(args.config_path)?;
     global_config.validate()?;
     global_config.fetch_raw_secrets().await?;
 
-    let opts = tartarus::migration::MigrationOptions {
+    let opts = hyperswitch_card_vault::migration::MigrationOptions {
         tenant_id: args.tenant_id,
         batch_size: args.batch_size,
         rps: args.rps,
@@ -229,17 +229,17 @@ async fn run_kms_migration(args: MigrateToKms) -> Result<(), Box<dyn std::error:
         verify_sample_size: args.verify_sample_size,
     };
 
-    tartarus::migration::run(&global_config, opts).await?;
+    hyperswitch_card_vault::migration::run(&global_config, opts).await?;
     Ok(())
 }
 
 #[cfg(feature = "kms-aws")]
 async fn run_kms_rekey(args: RekeyKms) -> Result<(), Box<dyn std::error::Error>> {
-    let mut global_config = tartarus::config::GlobalConfig::new_with_config_path(args.config_path)?;
+    let mut global_config = hyperswitch_card_vault::config::GlobalConfig::new_with_config_path(args.config_path)?;
     global_config.validate()?;
     global_config.fetch_raw_secrets().await?;
 
-    let opts = tartarus::migration::RekeyOptions {
+    let opts = hyperswitch_card_vault::migration::RekeyOptions {
         tenant_id: args.tenant_id,
         from_key_id: args.from_key_id,
         from_region: args.from_region,
@@ -253,7 +253,7 @@ async fn run_kms_rekey(args: RekeyKms) -> Result<(), Box<dyn std::error::Error>>
         verify_sample_size: args.verify_sample_size,
     };
 
-    tartarus::migration::run_rekey(&global_config, opts).await?;
+    hyperswitch_card_vault::migration::run_rekey(&global_config, opts).await?;
     Ok(())
 }
 
