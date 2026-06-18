@@ -36,6 +36,8 @@ enum SubCommand {
     JweDecrypt(JweD),
     #[cfg(feature = "kms-aws")]
     MigrateToKms(MigrateToKms),
+    #[cfg(feature = "kms-aws")]
+    RekeyKms(RekeyKms),
 }
 
 #[derive(argh::FromArgs, Debug)]
@@ -104,6 +106,53 @@ struct MigrateToKms {
     verify_sample_size: i64,
 }
 
+#[cfg(feature = "kms-aws")]
+#[derive(argh::FromArgs, Debug)]
+#[argh(subcommand, name = "rekey-kms")]
+/// Rotate cardholder data from one AWS KMS key to another (both in aws_kms
+/// mode). Run with the service paused. Reads each row, decrypts via the
+/// `--from` key, re-encrypts via the `--to` key under the same `entity_id`
+/// encryption context, writes back. After it verifies, point
+/// `tenant_secrets.kms_data_key.key_id` at the new key and restart.
+struct RekeyKms {
+    /// tenant id whose schema to rekey
+    #[argh(option, long = "tenant-id")]
+    tenant_id: String,
+    /// path to the locker config file (TOML); defaults to the locker's lookup
+    #[argh(option, long = "config-path")]
+    config_path: Option<PathBuf>,
+    /// KMS key id the rows are currently encrypted under (the live key)
+    #[argh(option, long = "from-key-id")]
+    from_key_id: String,
+    /// AWS region of the source key
+    #[argh(option, long = "from-region")]
+    from_region: String,
+    /// KMS key id to re-encrypt the rows under (the destination key)
+    #[argh(option, long = "to-key-id")]
+    to_key_id: String,
+    /// AWS region of the destination key
+    #[argh(option, long = "to-region")]
+    to_region: String,
+    /// rows per batch (default 500)
+    #[argh(option, long = "batch-size", default = "500")]
+    batch_size: i64,
+    /// soft cap on KMS calls per second (default 800); each row uses ~2 calls
+    #[argh(option, long = "rps", default = "800")]
+    rps: u32,
+    /// path to the checkpoint file (resume cursor)
+    #[argh(option, long = "checkpoint")]
+    checkpoint: PathBuf,
+    /// decrypt + re-encrypt every row but skip the UPDATE
+    #[argh(switch, long = "dry-run")]
+    dry_run: bool,
+    /// skip rekey; decrypt the most recent N rows with the target key and check hashes
+    #[argh(switch, long = "verify-only")]
+    verify_only: bool,
+    /// row count for --verify-only sampling (default 50)
+    #[argh(option, long = "verify-sample-size", default = "50")]
+    verify_sample_size: i64,
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Cli = argh::from_env();
 
@@ -154,6 +203,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let runtime = tokio::runtime::Runtime::new()?;
             runtime.block_on(run_kms_migration(args))?;
         }
+        #[cfg(feature = "kms-aws")]
+        SubCommand::RekeyKms(args) => {
+            let runtime = tokio::runtime::Runtime::new()?;
+            runtime.block_on(run_kms_rekey(args))?;
+        }
     }
 
     Ok(())
@@ -176,6 +230,30 @@ async fn run_kms_migration(args: MigrateToKms) -> Result<(), Box<dyn std::error:
     };
 
     tartarus::migration::run(&global_config, opts).await?;
+    Ok(())
+}
+
+#[cfg(feature = "kms-aws")]
+async fn run_kms_rekey(args: RekeyKms) -> Result<(), Box<dyn std::error::Error>> {
+    let mut global_config = tartarus::config::GlobalConfig::new_with_config_path(args.config_path)?;
+    global_config.validate()?;
+    global_config.fetch_raw_secrets().await?;
+
+    let opts = tartarus::migration::RekeyOptions {
+        tenant_id: args.tenant_id,
+        from_key_id: args.from_key_id,
+        from_region: args.from_region,
+        to_key_id: args.to_key_id,
+        to_region: args.to_region,
+        batch_size: args.batch_size,
+        rps: args.rps,
+        checkpoint_path: args.checkpoint,
+        dry_run: args.dry_run,
+        verify_only: args.verify_only,
+        verify_sample_size: args.verify_sample_size,
+    };
+
+    tartarus::migration::run_rekey(&global_config, opts).await?;
     Ok(())
 }
 

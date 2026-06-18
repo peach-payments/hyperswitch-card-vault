@@ -1,6 +1,9 @@
-//! One-time bulk migration of cardholder data from the internal AES-GCM
-//! key hierarchy (master_key → per-merchant DEK → row ciphertext) to direct
-//! AWS KMS Encrypt/Decrypt.
+//! One-time bulk migration jobs for cardholder data.
+//!
+//! - [`run`]: from the internal AES-GCM key hierarchy (master_key →
+//!   per-merchant DEK → row ciphertext) to direct AWS KMS Encrypt/Decrypt.
+//! - [`run_rekey`]: from one AWS KMS key to another, both already in
+//!   `external_key_manager = "aws_kms"` mode.
 //!
 //! Run against a tenant whose service is paused or read-only. After the run
 //! completes, flip `external_key_manager = "aws_kms"` and restart the
@@ -76,6 +79,25 @@ pub struct MigrationOptions {
     pub verify_sample_size: i64,
 }
 
+/// Options for rotating cardholder ciphertext from one AWS KMS key to another
+/// while staying in `external_key_manager = "aws_kms"` mode.
+#[derive(Clone, Debug)]
+pub struct RekeyOptions {
+    pub tenant_id: String,
+    /// KMS key the rows are currently encrypted under (the live key).
+    pub from_key_id: String,
+    pub from_region: String,
+    /// KMS key to re-encrypt the rows under (the destination key).
+    pub to_key_id: String,
+    pub to_region: String,
+    pub batch_size: i64,
+    pub rps: u32,
+    pub checkpoint_path: PathBuf,
+    pub dry_run: bool,
+    pub verify_only: bool,
+    pub verify_sample_size: i64,
+}
+
 pub async fn run(
     global_config: &GlobalConfig,
     opts: MigrationOptions,
@@ -118,8 +140,8 @@ pub async fn run(
     kms_probe(&kms, &opts.tenant_id).await?;
 
     if opts.verify_only {
-        verify_sample(&storage, &kms, &opts, Table::Locker).await?;
-        verify_sample(&storage, &kms, &opts, Table::Vault).await?;
+        verify_sample(&storage, &kms, opts.verify_sample_size, Table::Locker).await?;
+        verify_sample(&storage, &kms, opts.verify_sample_size, Table::Vault).await?;
         return Ok(());
     }
 
@@ -154,6 +176,194 @@ pub async fn run(
     .await?;
 
     println!("migration complete (dry_run={})", opts.dry_run);
+    Ok(())
+}
+
+/// Rotate cardholder ciphertext from one AWS KMS key (`from`) to another
+/// (`to`), both under the same `{"entity_id": …}` encryption context. Used
+/// when the tenant is already in `external_key_manager = "aws_kms"` mode and
+/// needs to move to a new KMS key (e.g. key compromise, account migration, or
+/// a scheduled key replacement that can't be served by AWS automatic key
+/// rotation because that rotates backing material, not the key ARN).
+///
+/// Run with the service paused or read-only. The source key must remain
+/// enabled (with Decrypt permission) for the duration; the target key needs
+/// Encrypt + Decrypt. After the run completes and verifies, point
+/// `tenant_secrets.kms_data_key.key_id` at the new key and restart.
+///
+/// Idempotency mirrors [`run`]: the same JSON checkpoint holds the highest
+/// `id` rekeyed per table and the job resumes from `id > cursor`. Because both
+/// sides are KMS under the same context, a row that was written but whose
+/// cursor was not yet persisted (crash mid-batch) is detected on resume — the
+/// source key can no longer decrypt it, but the target key can, so it is
+/// recognised as already-done and skipped rather than treated as an error.
+pub async fn run_rekey(
+    global_config: &GlobalConfig,
+    opts: RekeyOptions,
+) -> Result<(), MigrationError> {
+    if opts.from_key_id == opts.to_key_id {
+        return Err(MigrationError::Configuration(
+            "--from-key-id and --to-key-id are identical; nothing to rekey".into(),
+        ));
+    }
+
+    let tenant_config = TenantConfig::from_global_config(global_config, opts.tenant_id.clone());
+
+    let source = Arc::new(
+        AwsKmsClient::new(&AwsKmsConfig {
+            key_id: opts.from_key_id.clone(),
+            region: opts.from_region.clone(),
+        })
+        .await,
+    );
+    let target = Arc::new(
+        AwsKmsClient::new(&AwsKmsConfig {
+            key_id: opts.to_key_id.clone(),
+            region: opts.to_region.clone(),
+        })
+        .await,
+    );
+
+    let storage = Storage::new(&global_config.database, &tenant_config.tenant_secrets.schema)
+        .await
+        .map_err(|e| MigrationError::Storage(format!("opening pool: {e:?}")))?;
+
+    println!(
+        "preflight: probing source KMS key {} in {}",
+        opts.from_key_id, opts.from_region
+    );
+    kms_probe(&source, &opts.tenant_id).await?;
+    println!(
+        "preflight: probing target KMS key {} in {}",
+        opts.to_key_id, opts.to_region
+    );
+    kms_probe(&target, &opts.tenant_id).await?;
+
+    if opts.verify_only {
+        // Verify against the *target* key — the state the data should be in
+        // after a successful rekey.
+        verify_sample(&storage, &target, opts.verify_sample_size, Table::Locker).await?;
+        verify_sample(&storage, &target, opts.verify_sample_size, Table::Vault).await?;
+        return Ok(());
+    }
+
+    let mut checkpoint = Checkpoint::load(&opts.checkpoint_path)?;
+    let mut limiter = RateLimiter::new(opts.rps);
+
+    println!("rekeying `locker` rows id > {}", checkpoint.locker_cursor);
+    rekey_table(
+        &storage,
+        &source,
+        &target,
+        &opts,
+        Table::Locker,
+        &mut checkpoint,
+        &mut limiter,
+    )
+    .await?;
+
+    println!("rekeying `vault` rows id > {}", checkpoint.vault_cursor);
+    rekey_table(
+        &storage,
+        &source,
+        &target,
+        &opts,
+        Table::Vault,
+        &mut checkpoint,
+        &mut limiter,
+    )
+    .await?;
+
+    println!("rekey complete (dry_run={})", opts.dry_run);
+    Ok(())
+}
+
+async fn rekey_table(
+    storage: &Storage,
+    source: &Arc<AwsKmsClient>,
+    target: &Arc<AwsKmsClient>,
+    opts: &RekeyOptions,
+    table: Table,
+    checkpoint: &mut Checkpoint,
+    limiter: &mut RateLimiter,
+) -> Result<(), MigrationError> {
+    let mut total = 0_u64;
+    let mut skipped = 0_u64;
+
+    loop {
+        let mut conn = storage
+            .get_conn()
+            .await
+            .map_err(|e| MigrationError::Storage(format!("acquiring conn: {e:?}")))?;
+
+        let rows = load_batch(&mut conn, table, cursor(checkpoint, table), opts.batch_size).await?;
+
+        if rows.is_empty() {
+            break;
+        }
+
+        for Row {
+            id,
+            entity_id,
+            ciphertext,
+        } in rows
+        {
+            let ctx = encryption_context(&entity_id);
+
+            // Decrypt with the source key. Each rekeyed row costs two KMS
+            // calls (Decrypt + Encrypt), so effective row throughput is about
+            // `rps / 2`.
+            limiter.acquire().await;
+            let plaintext = match source.decrypt(&ciphertext, Some(ctx.clone())).await {
+                Ok(plaintext) => plaintext,
+                Err(source_err) => {
+                    // The source key failed. This is expected for a row that
+                    // was already rekeyed but whose cursor was not persisted
+                    // (crash mid-batch). If the target key can read it under
+                    // the same context, it is already done — skip it.
+                    // Otherwise it is a genuine failure.
+                    limiter.acquire().await;
+                    if target.decrypt(&ciphertext, Some(ctx.clone())).await.is_ok() {
+                        advance_cursor(checkpoint, table, id);
+                        skipped += 1;
+                        continue;
+                    }
+                    return Err(MigrationError::Decrypt {
+                        table: table.name(),
+                        id,
+                        reason: format!(
+                            "source KMS decrypt failed and the row is not readable \
+                             with the target key: {source_err:?}"
+                        ),
+                    });
+                }
+            };
+
+            limiter.acquire().await;
+            let new_blob = target.encrypt(&plaintext, Some(ctx)).await.map_err(|e| {
+                MigrationError::KmsEncrypt {
+                    table: table.name(),
+                    id,
+                    reason: format!("{e:?}"),
+                }
+            })?;
+
+            if !opts.dry_run {
+                write_back(&mut conn, table, id, new_blob).await?;
+            }
+
+            advance_cursor(checkpoint, table, id);
+            total += 1;
+        }
+
+        checkpoint.persist()?;
+        println!(
+            "{}: {total} rekeyed, {skipped} already-done, cursor at {}",
+            table.name(),
+            cursor(checkpoint, table)
+        );
+    }
+
     Ok(())
 }
 
@@ -384,7 +594,7 @@ async fn kms_probe(kms: &AwsKmsClient, tenant_id: &str) -> Result<(), MigrationE
 async fn verify_sample(
     storage: &Storage,
     kms: &AwsKmsClient,
-    opts: &MigrationOptions,
+    sample_size: i64,
     table: Table,
 ) -> Result<(), MigrationError> {
     let mut conn = storage
@@ -405,7 +615,7 @@ async fn verify_sample(
                     schema::locker::hash_id,
                 ))
                 .order(schema::locker::id.desc())
-                .limit(opts.verify_sample_size)
+                .limit(sample_size)
                 .load(&mut conn)
                 .await
                 .map_err(|e| MigrationError::Storage(format!("verify locker: {e}")))?;
@@ -450,7 +660,7 @@ async fn verify_sample(
                     schema::vault::encrypted_data,
                 ))
                 .order(schema::vault::id.desc())
-                .limit(opts.verify_sample_size)
+                .limit(sample_size)
                 .load(&mut conn)
                 .await
                 .map_err(|e| MigrationError::Storage(format!("verify vault: {e}")))?;
